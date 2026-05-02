@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-This is an automation script for running the experiments in this repo on a linux machine. It handles input generation, execution, data collection, and plotting.This script wraps the compiled C++ OpenMP executable. It generates format inputs, runs the required algorithms across multiple configurations,
-collects timing data into CSV files, and produces report-ready PNG plots.
-Generated with help of Chatgpt to help in experimentation and logging.
+This automation script runs the matrix multiplication experiments for this repo.
+It handles input generation, execution, data collection, and plotting.
+
+The script wraps the compiled C++ OpenMP executable, generates assignment-format
+inputs, runs the configured algorithms across multiple configurations, collects
+timing data into CSV files, and produces report-ready PNG plots.
+
+Matplotlib is required for plot generation.
 """
 
 from __future__ import annotations
@@ -21,7 +26,13 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image, ImageDraw, ImageFont
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    matplotlib = None
+    plt = None
 
 try:
     from generate_input import is_power_of_two, write_matrix_rows
@@ -31,42 +42,43 @@ except ModuleNotFoundError:
 
 ALGORITHMS = ("Sequential", "ParMtrixMult", "Strassen", "ParStrassen")
 DEFAULT_BASE_CASE = 64
+COMMON_MATRIX_EXPONENTS = [7, 8, 9, 10, 11, 12, 13, 14]
 ALGORITHM_CONFIGS = {
     "Sequential": {
         "enabled": True,
-        "matrix_exponents": [7, 8, 9, 10],
+        "matrix_exponents": COMMON_MATRIX_EXPONENTS,
         "threads": [1],
         "base_cases": [DEFAULT_BASE_CASE],
         "repetitions": 1,
     },
     "ParMtrixMult": {
         "enabled": True,
-        "matrix_exponents": [7, 8, 9, 10, 11, 12, 13, 14],
+        "matrix_exponents": COMMON_MATRIX_EXPONENTS,
         "threads": [2, 4, 8,16 , 18 , 20, 24, 28, 32],
         "base_cases": [DEFAULT_BASE_CASE],
         "repetitions": 1,
     },
     "Strassen": {
         "enabled": True,
-        "matrix_exponents": [7, 8, 9, 10],
+        "matrix_exponents": COMMON_MATRIX_EXPONENTS,
         "threads": [1],
         "base_cases": [16, 32, 64, 128],
         "repetitions": 1,
     },
     "ParStrassen": {
         "enabled": True,
-        "matrix_exponents": [7, 8, 9, 10, 11, 12, 13, 14],
+        "matrix_exponents": COMMON_MATRIX_EXPONENTS,
         "threads": [2, 4, 8,16 , 18 , 20, 24, 28, 32],
         "base_cases": [16, 32, 64, 128],
         "repetitions": 1,
     },
 }
-PNG_WIDTH = 1280
-PNG_HEIGHT = 720
-PLOT_MARGIN_LEFT = 88
-PLOT_MARGIN_RIGHT = 36
-PLOT_MARGIN_TOP = 56
-PLOT_MARGIN_BOTTOM = 84
+PLOT_FIGSIZE = (14, 8)
+PLOT_DPI = 160
+PLOT_TITLE_SIZE = 20
+PLOT_LABEL_SIZE = 16
+PLOT_TICK_SIZE = 13
+PLOT_LEGEND_SIZE = 12
 SERIES_COLORS = (
     "#1f77b4",
     "#d62728",
@@ -82,13 +94,19 @@ SERIES_COLORS = (
 @dataclass
 class RunRecord:
     algorithm: str
+    n: int
     matrix_size: int
+    t: int
     threads: int
+    b: int
     base_case: int
+    run: int
     run_index: int
     seed: int
     status: str
+    wall: float | None
     runtime_seconds: float | None
+    reported_runtime_seconds: float | None
     formatted_time: str | None
     reported_cores: int | None
     input_file: str
@@ -98,7 +116,6 @@ class RunRecord:
     stderr_log: str
     mismatch_warning: bool
     timed_out: bool
-    wall_clock_seconds: float | None
 
 
 @dataclass
@@ -499,6 +516,17 @@ def check_required_tools() -> list[ToolStatus]:
             ),
         )
     )
+    statuses.append(
+        ToolStatus(
+            name="matplotlib",
+            found=plt is not None,
+            detail=(
+                f"matplotlib {matplotlib.__version__}"
+                if matplotlib is not None
+                else "not installed; required for PNG plot generation"
+            ),
+        )
+    )
     return statuses
 
 
@@ -515,11 +543,11 @@ def install_hint(os_info: OsInfo) -> str | None:
     ).lower()
 
     if "fedora" in distro_tokens or "rhel" in distro_tokens or "centos" in distro_tokens:
-        return "sudo dnf install gcc-c++ make bash"
+        return "sudo dnf install gcc-c++ make bash python3-matplotlib"
     if "ubuntu" in distro_tokens or "debian" in distro_tokens:
-        return "sudo apt update && sudo apt install -y g++ make bash"
+        return "sudo apt update && sudo apt install -y g++ make bash python3-matplotlib"
     if os_info.system == "darwin":
-        return "brew install bash gcc"
+        return "brew install bash gcc matplotlib"
     return None
 
 
@@ -589,21 +617,29 @@ def ensure_built_executable(repo_root: Path, args: argparse.Namespace) -> Path:
 
     build_dir.mkdir(parents=True, exist_ok=True)
     build_script = repo_root / "scripts" / "build.sh"
-    if not build_script.is_file():
-        raise FileNotFoundError(f"Build script not found at {build_script}")
-
     bash_path = find_command("bash")
-    if bash_path is None:
-        raise FileNotFoundError(
-            "Could not find 'bash' in PATH, which is required to run scripts/build.sh. "
-            "Install bash or pass --skip-build with --executable."
+    if build_script.is_file() and bash_path is not None:
+        run_checked_command(
+            [bash_path, str(build_script)],
+            repo_root,
+            "Building matrix_mult executable with scripts/build.sh...",
         )
+    else:
+        cmake_cache = build_dir / "CMakeCache.txt"
+        if not cmake_cache.exists():
+            run_checked_command(
+                ["cmake", "-S", str(repo_root), "-B", str(build_dir)],
+                repo_root,
+                "Configuring project with CMake...",
+            )
+        else:
+            print(f"Reusing existing CMake configuration in {build_dir}")
 
-    run_checked_command(
-        [bash_path, str(build_script)],
-        repo_root,
-        "Building matrix_mult executable with scripts/build.sh...",
-    )
+        run_checked_command(
+            ["cmake", "--build", str(build_dir)],
+            repo_root,
+            "Building matrix_mult executable with CMake...",
+        )
 
     try:
         executable = detect_executable(build_dir, explicit)
@@ -648,8 +684,8 @@ def write_assignment_input(
         write_matrix_rows(output_file, matrix_b)
 
 
-def input_stem_for_size(matrix_size: int) -> str:
-    return f"input_{matrix_size}"
+def input_stem_for_run(matrix_size: int, run_index: int) -> str:
+    return f"input{run_index}-{matrix_size}"
 
 
 def read_info_file(info_path: Path) -> tuple[str, int, float]:
@@ -697,30 +733,27 @@ def command_for_run(
 
 
 def parameter_tag_for_run(algorithm: str, threads: int, base_case: int) -> str:
-    parts: list[str] = []
+    if algorithm == "Sequential":
+        return ""
     if algorithm == "ParMtrixMult":
-        parts.append(f"threads-{threads}")
-    elif algorithm == "Strassen":
-        parts.append(f"basecase-{base_case}")
-    elif algorithm == "ParStrassen":
-        parts.append(f"threads-{threads}")
-        parts.append(f"basecase-{base_case}")
-    return "-".join(parts)
+        return f"t{threads}"
+    if algorithm == "Strassen":
+        return f"b{base_case}"
+    if algorithm == "ParStrassen":
+        return f"t{threads}-b{base_case}"
+    return ""
 
 
-def artifact_suffix_for_run(
-    algorithm: str,
-    threads: int,
-    base_case: int,
-    run_index: int,
-    total_runs: int,
-) -> str:
-    parameter_tag = parameter_tag_for_run(algorithm, threads, base_case)
-    if total_runs > 1:
-        if parameter_tag:
-            return f"{parameter_tag}-run-{run_index}"
-        return f"run-{run_index}"
-    return parameter_tag
+def emitted_parameter_tag_for_run(algorithm: str, threads: int, base_case: int) -> str:
+    if algorithm == "Sequential":
+        return ""
+    if algorithm == "ParMtrixMult":
+        return f"threads-{threads}"
+    if algorithm == "Strassen":
+        return f"basecase-{base_case}"
+    if algorithm == "ParStrassen":
+        return f"threads-{threads}-basecase-{base_case}"
+    return ""
 
 
 def run_algorithm(
@@ -733,36 +766,31 @@ def run_algorithm(
     threads: int,
     base_case: int,
     run_index: int,
-    total_runs: int,
     seed: int,
     timeout_seconds: int,
 ) -> RunRecord:
     command = command_for_run(executable, input_path, threads, base_case, algorithm)
     parameter_tag = parameter_tag_for_run(algorithm, threads, base_case)
-    artifact_suffix = artifact_suffix_for_run(algorithm, threads, base_case, run_index, total_runs)
-
-    generated_output_name = f"{input_path.stem}-output-{algorithm}"
-    generated_info_name = f"{input_path.stem}-info-{algorithm}"
-    if parameter_tag:
-        generated_output_name += f"-{parameter_tag}"
-        generated_info_name += f"-{parameter_tag}"
-    generated_output_file = repo_root / f"{generated_output_name}.txt"
-    generated_info_file = repo_root / f"{generated_info_name}.txt"
-
+    emitted_parameter_tag = emitted_parameter_tag_for_run(algorithm, threads, base_case)
     output_matrix_name = f"{input_path.stem}-output-{algorithm}"
     info_name = f"{input_path.stem}-info-{algorithm}"
-    log_name = f"{input_path.stem}-{algorithm}"
-    if artifact_suffix:
-        output_matrix_name += f"-{artifact_suffix}"
-        info_name += f"-{artifact_suffix}"
-        log_name += f"-{artifact_suffix}"
+    if parameter_tag:
+        output_matrix_name += f"-{parameter_tag}"
+        info_name += f"-{parameter_tag}"
     output_matrix_file = repo_root / f"{output_matrix_name}.txt"
     info_file = repo_root / f"{info_name}.txt"
-    stdout_log = results_dir / f"{log_name}-stdout.log"
-    stderr_log = results_dir / f"{log_name}-stderr.log"
+    emitted_output_matrix_name = f"{input_path.stem}-output-{algorithm}"
+    emitted_info_name = f"{input_path.stem}-info-{algorithm}"
+    if emitted_parameter_tag:
+        emitted_output_matrix_name += f"-{emitted_parameter_tag}"
+        emitted_info_name += f"-{emitted_parameter_tag}"
+    emitted_output_matrix_file = repo_root / f"{emitted_output_matrix_name}.txt"
+    emitted_info_file = repo_root / f"{emitted_info_name}.txt"
+    stdout_log = results_dir / f"{input_path.stem}-{algorithm}-stdout.log"
+    stderr_log = results_dir / f"{input_path.stem}-{algorithm}-stderr.log"
 
-    started_at = time.perf_counter()
     try:
+        started_at = time.perf_counter()
         completed = subprocess.run(
             command,
             cwd=repo_root,
@@ -771,19 +799,25 @@ def run_algorithm(
             timeout=timeout_seconds,
             check=False,
         )
+        wall_time_seconds = time.perf_counter() - started_at
     except subprocess.TimeoutExpired as error:
-        elapsed = time.perf_counter() - started_at
         stdout_log.write_text(error.stdout or "", encoding="utf-8")
         stderr_log.write_text(error.stderr or "", encoding="utf-8")
         return RunRecord(
             algorithm=algorithm,
+            n=matrix_size,
             matrix_size=matrix_size,
+            t=threads,
             threads=threads,
+            b=base_case,
             base_case=base_case,
+            run=run_index,
             run_index=run_index,
             seed=seed,
             status="timeout",
+            wall=None,
             runtime_seconds=None,
+            reported_runtime_seconds=None,
             formatted_time=None,
             reported_cores=None,
             input_file=relative_to(input_path, repo_root),
@@ -793,10 +827,8 @@ def run_algorithm(
             stderr_log=relative_to(stderr_log, repo_root),
             mismatch_warning="Warning:" in (error.stderr or ""),
             timed_out=True,
-            wall_clock_seconds=round(elapsed, 3),
         )
 
-    elapsed = time.perf_counter() - started_at
     stdout_log.write_text(completed.stdout, encoding="utf-8")
     stderr_log.write_text(completed.stderr, encoding="utf-8")
     mismatch_warning = "Warning:" in completed.stderr
@@ -804,13 +836,19 @@ def run_algorithm(
     if completed.returncode != 0:
         return RunRecord(
             algorithm=algorithm,
+            n=matrix_size,
             matrix_size=matrix_size,
+            t=threads,
             threads=threads,
+            b=base_case,
             base_case=base_case,
+            run=run_index,
             run_index=run_index,
             seed=seed,
             status=f"failed_returncode_{completed.returncode}",
+            wall=None,
             runtime_seconds=None,
+            reported_runtime_seconds=None,
             formatted_time=None,
             reported_cores=None,
             input_file=relative_to(input_path, repo_root),
@@ -820,28 +858,24 @@ def run_algorithm(
             stderr_log=relative_to(stderr_log, repo_root),
             mismatch_warning=mismatch_warning,
             timed_out=False,
-            wall_clock_seconds=round(elapsed, 3),
         )
 
-    if total_runs > 1:
-        if generated_output_file.exists():
-            generated_output_file.replace(output_matrix_file)
-        if generated_info_file.exists():
-            generated_info_file.replace(info_file)
-    else:
-        output_matrix_file = generated_output_file
-        info_file = generated_info_file
-
-    if not info_file.exists():
+    if not emitted_info_file.exists():
         return RunRecord(
             algorithm=algorithm,
+            n=matrix_size,
             matrix_size=matrix_size,
+            t=threads,
             threads=threads,
+            b=base_case,
             base_case=base_case,
+            run=run_index,
             run_index=run_index,
             seed=seed,
             status="missing_info_file",
+            wall=None,
             runtime_seconds=None,
+            reported_runtime_seconds=None,
             formatted_time=None,
             reported_cores=None,
             input_file=relative_to(input_path, repo_root),
@@ -851,19 +885,28 @@ def run_algorithm(
             stderr_log=relative_to(stderr_log, repo_root),
             mismatch_warning=mismatch_warning,
             timed_out=False,
-            wall_clock_seconds=round(elapsed, 3),
         )
 
-    formatted_time, reported_cores, runtime_seconds = read_info_file(info_file)
+    formatted_time, reported_cores, reported_runtime_seconds = read_info_file(emitted_info_file)
+    if emitted_output_matrix_file.exists() and emitted_output_matrix_file != output_matrix_file:
+        shutil.copyfile(emitted_output_matrix_file, output_matrix_file)
+    if emitted_info_file != info_file:
+        shutil.copyfile(emitted_info_file, info_file)
     return RunRecord(
         algorithm=algorithm,
+        n=matrix_size,
         matrix_size=matrix_size,
+        t=threads,
         threads=threads,
+        b=base_case,
         base_case=base_case,
+        run=run_index,
         run_index=run_index,
         seed=seed,
         status="ok",
-        runtime_seconds=runtime_seconds,
+        wall=wall_time_seconds,
+        runtime_seconds=wall_time_seconds,
+        reported_runtime_seconds=reported_runtime_seconds,
         formatted_time=formatted_time,
         reported_cores=reported_cores,
         input_file=relative_to(input_path, repo_root),
@@ -873,18 +916,7 @@ def run_algorithm(
         stderr_log=relative_to(stderr_log, repo_root),
         mismatch_warning=mismatch_warning,
         timed_out=False,
-        wall_clock_seconds=round(elapsed, 3),
     )
-
-
-def count_size_configurations(matrix_size: int, configs: dict[str, AlgorithmRunConfig]) -> int:
-    total = 0
-    for algorithm_name in ALGORITHMS:
-        config = configs[algorithm_name]
-        if not config.enabled or matrix_size not in config.matrix_sizes:
-            continue
-        total += config.repetitions * len(config.base_cases) * len(config.threads)
-    return total
 
 
 def write_csv(path: Path, fieldnames: list[str], rows: Iterable[dict[str, object]]) -> None:
@@ -907,10 +939,15 @@ def aggregate_records(records: list[RunRecord]) -> list[dict[str, object]]:
         summary_rows.append(
             {
                 "algorithm": algorithm,
+                "n": matrix_size,
                 "matrix_size": matrix_size,
+                "t": threads,
                 "threads": threads,
+                "b": base_case,
                 "base_case": base_case,
+                "run": runs[0].run_index if len(runs) == 1 else "all",
                 "runs": len(values),
+                "wall": round(avg_seconds, 6),
                 "avg_runtime_seconds": round(avg_seconds, 6),
                 "min_runtime_seconds": round(min(values), 6),
                 "max_runtime_seconds": round(max(values), 6),
@@ -942,44 +979,6 @@ def algorithm_slug(name: str) -> str:
     return name.lower()
 
 
-def select_baseline_row(
-    rows: list[dict[str, object]],
-    algorithm: str,
-    matrix_size: int,
-    comparison_base_case: int,
-) -> dict[str, object] | None:
-    candidates = [
-        row for row in rows
-        if row["algorithm"] == algorithm and int(row["matrix_size"]) == matrix_size
-    ]
-    if not candidates:
-        return None
-
-    preferred = [
-        row for row in candidates
-        if int(row["base_case"]) == comparison_base_case
-    ]
-    pool = preferred if preferred else candidates
-    return min(pool, key=lambda row: (int(row["threads"]), int(row["base_case"])))
-
-
-def select_row_for_base_case(
-    rows: list[dict[str, object]],
-    algorithm: str,
-    matrix_size: int,
-    base_case: int,
-) -> dict[str, object] | None:
-    candidates = [
-        row for row in rows
-        if row["algorithm"] == algorithm
-        and int(row["matrix_size"]) == matrix_size
-        and int(row["base_case"]) == base_case
-    ]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda row: int(row["threads"]))
-
-
 def build_plot_specs(
     aggregated_rows: list[dict[str, object]],
     comparison_base_case: int,
@@ -996,15 +995,14 @@ def build_plot_specs(
         points = []
         for size in sizes:
             if algorithm == "Sequential":
-                row = select_baseline_row(aggregated_rows, algorithm, size, comparison_base_case)
+                key = (algorithm, size, 1, comparison_base_case)
             elif algorithm == "ParMtrixMult":
                 best_threads = best_parallel_thread(aggregated_rows, algorithm, size)
                 if best_threads is None:
                     continue
                 key = (algorithm, size, best_threads, comparison_base_case)
-                row = lookup.get(key)
             elif algorithm == "Strassen":
-                row = select_baseline_row(aggregated_rows, algorithm, size, comparison_base_case)
+                key = (algorithm, size, 1, comparison_base_case)
             else:
                 best_threads = best_parallel_thread(
                     [
@@ -1017,7 +1015,7 @@ def build_plot_specs(
                 if best_threads is None:
                     continue
                 key = (algorithm, size, best_threads, comparison_base_case)
-                row = lookup.get(key)
+            row = lookup.get(key)
             if row is not None:
                 points.append((size, float(row["avg_runtime_seconds"])))
         if points:
@@ -1036,7 +1034,7 @@ def build_plot_specs(
 
     pm_speedup = {}
     for size in sizes:
-        seq = select_baseline_row(aggregated_rows, "Sequential", size, comparison_base_case)
+        seq = lookup.get(("Sequential", size, 1, comparison_base_case))
         if seq is None:
             continue
         series_points = []
@@ -1063,7 +1061,7 @@ def build_plot_specs(
 
     ps_speedup = {}
     for size in sizes:
-        base_row = select_baseline_row(aggregated_rows, "Strassen", size, comparison_base_case)
+        base_row = lookup.get(("Strassen", size, 1, comparison_base_case))
         if base_row is None:
             continue
         series_points = []
@@ -1092,7 +1090,7 @@ def build_plot_specs(
     for size in sizes:
         points = []
         for base_case in base_cases:
-            row = select_row_for_base_case(aggregated_rows, "Strassen", size, base_case)
+            row = lookup.get(("Strassen", size, 1, base_case))
             if row is not None:
                 points.append((base_case, float(row["avg_runtime_seconds"])))
         if points:
@@ -1139,7 +1137,7 @@ def build_plot_specs(
 
     efficiency = {}
     for size in sizes:
-        seq = select_baseline_row(aggregated_rows, "Sequential", size, comparison_base_case)
+        seq = lookup.get(("Sequential", size, 1, comparison_base_case))
         if seq is not None:
             points = []
             for thread in threads:
@@ -1153,7 +1151,7 @@ def build_plot_specs(
             if points:
                 efficiency[f"ParMtrixMult n={size}"] = points
 
-        strassen = select_baseline_row(aggregated_rows, "Strassen", size, comparison_base_case)
+        strassen = lookup.get(("Strassen", size, 1, comparison_base_case))
         if strassen is not None:
             points = []
             for thread in threads:
@@ -1223,157 +1221,114 @@ def build_plot_specs(
     return plot_specs
 
 
-def make_canvas(title: str) -> tuple[Image.Image, ImageDraw.ImageDraw, ImageFont.ImageFont]:
-    image = Image.new("RGB", (PNG_WIDTH, PNG_HEIGHT), "white")
-    draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
-    draw.text((PLOT_MARGIN_LEFT, 20), title, fill="black", font=font)
-    return image, draw, font
+def build_raw_run_plot_specs(records: list[RunRecord]) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, int, int, int], list[RunRecord]] = defaultdict(list)
+    for record in records:
+        if record.status == "ok" and record.runtime_seconds is not None:
+            grouped[(record.algorithm, record.matrix_size, record.threads, record.base_case)].append(record)
+
+    plot_specs: list[dict[str, object]] = []
+    for (algorithm, matrix_size, threads, base_case), runs in sorted(grouped.items()):
+        points = sorted(
+            ((run.run_index, float(run.runtime_seconds)) for run in runs if run.runtime_seconds is not None),
+            key=lambda point: point[0],
+        )
+        if not points:
+            continue
+        plot_specs.append(
+            {
+                "kind": "raw_run_line",
+                "filename": f"{algorithm_slug(algorithm)}_runs_n{matrix_size}_t{threads}_b{base_case}.png",
+                "title": f"{algorithm} Runtime per Run at n={matrix_size}, t={threads}, b={base_case}",
+                "x_label": "Run index",
+                "y_label": "Runtime (seconds)",
+                "series": {algorithm: points},
+            }
+        )
+    return plot_specs
 
 
-def value_bounds(series: dict[str, list[tuple[float, float]]]) -> tuple[float, float, float, float]:
-    x_values = [point[0] for points in series.values() for point in points]
-    y_values = [point[1] for points in series.values() for point in points]
-    x_min = min(x_values)
-    x_max = max(x_values)
-    y_min = min(y_values)
-    y_max = max(y_values)
-    if x_min == x_max:
-        x_min -= 1
-        x_max += 1
-    if y_min == y_max:
-        y_min = 0
-        y_max += 1
-    else:
-        y_min = min(0.0, y_min)
-        y_max *= 1.1
-    return x_min, x_max, y_min, y_max
+def apply_plot_style() -> None:
+    assert plt is not None
+    plt.rcParams.update(
+        {
+            "figure.figsize": PLOT_FIGSIZE,
+            "figure.dpi": PLOT_DPI,
+            "axes.titlesize": PLOT_TITLE_SIZE,
+            "axes.labelsize": PLOT_LABEL_SIZE,
+            "xtick.labelsize": PLOT_TICK_SIZE,
+            "ytick.labelsize": PLOT_TICK_SIZE,
+            "legend.fontsize": PLOT_LEGEND_SIZE,
+        }
+    )
 
 
-def scale_point(
-    x: float,
-    y: float,
-    x_min: float,
-    x_max: float,
-    y_min: float,
-    y_max: float,
-) -> tuple[int, int]:
-    plot_width = PNG_WIDTH - PLOT_MARGIN_LEFT - PLOT_MARGIN_RIGHT
-    plot_height = PNG_HEIGHT - PLOT_MARGIN_TOP - PLOT_MARGIN_BOTTOM
-    px = PLOT_MARGIN_LEFT + int((x - x_min) / (x_max - x_min) * plot_width)
-    py = PLOT_MARGIN_TOP + plot_height - int((y - y_min) / (y_max - y_min) * plot_height)
-    return px, py
-
-
-def draw_axes(
-    draw: ImageDraw.ImageDraw,
-    font: ImageFont.ImageFont,
-    x_label: str,
-    y_label: str,
-    x_min: float,
-    x_max: float,
-    y_min: float,
-    y_max: float,
-) -> None:
-    left = PLOT_MARGIN_LEFT
-    right = PNG_WIDTH - PLOT_MARGIN_RIGHT
-    top = PLOT_MARGIN_TOP
-    bottom = PNG_HEIGHT - PLOT_MARGIN_BOTTOM
-    draw.line((left, top, left, bottom), fill="black", width=2)
-    draw.line((left, bottom, right, bottom), fill="black", width=2)
-
-    for index in range(6):
-        x_value = x_min + (x_max - x_min) * index / 5
-        x_pos, _ = scale_point(x_value, y_min, x_min, x_max, y_min, y_max)
-        draw.line((x_pos, bottom, x_pos, bottom + 6), fill="black", width=1)
-        label = f"{int(x_value) if x_value.is_integer() else round(x_value, 2)}"
-        draw.text((x_pos - 10, bottom + 10), label, fill="black", font=font)
-
-    for index in range(6):
-        y_value = y_min + (y_max - y_min) * index / 5
-        _, y_pos = scale_point(x_min, y_value, x_min, x_max, y_min, y_max)
-        draw.line((left - 6, y_pos, left, y_pos), fill="black", width=1)
-        label = f"{round(y_value, 2)}"
-        draw.text((8, y_pos - 6), label, fill="black", font=font)
-
-    draw.text((PNG_WIDTH // 2 - 50, PNG_HEIGHT - 36), x_label, fill="black", font=font)
-    draw.text((10, 36), y_label, fill="black", font=font)
-
-
-def draw_line_plot(
+def render_line_plot(
     output_path: Path,
     title: str,
     x_label: str,
     y_label: str,
     series: dict[str, list[tuple[float, float]]],
 ) -> None:
-    image, draw, font = make_canvas(title)
-    x_min, x_max, y_min, y_max = value_bounds(series)
-    draw_axes(draw, font, x_label, y_label, x_min, x_max, y_min, y_max)
+    assert plt is not None
+    apply_plot_style()
 
-    legend_x = PNG_WIDTH - 260
-    legend_y = 20
+    fig, ax = plt.subplots()
     for index, (name, points) in enumerate(sorted(series.items())):
         color = SERIES_COLORS[index % len(SERIES_COLORS)]
         sorted_points = sorted(points)
-        scaled = [
-            scale_point(x, y, x_min, x_max, y_min, y_max)
-            for x, y in sorted_points
-        ]
-        if len(scaled) >= 2:
-            draw.line(scaled, fill=color, width=3)
-        for px, py in scaled:
-            draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill=color, outline=color)
+        x_values = [point[0] for point in sorted_points]
+        y_values = [point[1] for point in sorted_points]
+        ax.plot(
+            x_values,
+            y_values,
+            marker="o",
+            linewidth=2.5,
+            markersize=7,
+            color=color,
+            label=name,
+        )
 
-        ly = legend_y + index * 20
-        draw.line((legend_x, ly + 7, legend_x + 18, ly + 7), fill=color, width=3)
-        draw.text((legend_x + 24, ly), name, fill="black", font=font)
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.grid(True, which="major", axis="both", linestyle="--", linewidth=0.7, alpha=0.5)
+    if len(series) > 1:
+        ax.legend(loc="best")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path, format="PNG")
+    fig.tight_layout()
+    fig.savefig(output_path, format="png")
+    plt.close(fig)
 
 
-def draw_bar_plot(
+def render_bar_plot(
     output_path: Path,
     title: str,
     x_label: str,
     y_label: str,
     bars: list[tuple[str, float]],
 ) -> None:
-    image, draw, font = make_canvas(title)
-    left = PLOT_MARGIN_LEFT
-    right = PNG_WIDTH - PLOT_MARGIN_RIGHT
-    top = PLOT_MARGIN_TOP
-    bottom = PNG_HEIGHT - PLOT_MARGIN_BOTTOM
-    plot_width = right - left
-    plot_height = bottom - top
+    assert plt is not None
+    apply_plot_style()
 
-    draw.line((left, top, left, bottom), fill="black", width=2)
-    draw.line((left, bottom, right, bottom), fill="black", width=2)
+    labels = [label for label, _ in bars]
+    values = [value for _, value in bars]
+    colors = [SERIES_COLORS[index % len(SERIES_COLORS)] for index in range(len(bars))]
 
-    max_value = max(value for _, value in bars)
-    padded_max = max(1.0, max_value * 1.1)
-    for index in range(6):
-        value = padded_max * index / 5
-        y_pos = bottom - int((value / padded_max) * plot_height)
-        draw.line((left - 6, y_pos, left, y_pos), fill="black", width=1)
-        draw.text((8, y_pos - 6), f"{round(value, 2)}", fill="black", font=font)
+    fig, ax = plt.subplots()
+    ax.bar(labels, values, color=colors)
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.grid(True, which="major", axis="y", linestyle="--", linewidth=0.7, alpha=0.5)
+    if len(labels) > 6 or any(len(label) > 4 for label in labels):
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
 
-    bar_width = max(32, int(plot_width / max(len(bars), 1) * 0.5))
-    gap = int((plot_width - bar_width * len(bars)) / max(len(bars) + 1, 1))
-    x_pos = left + gap
-
-    for index, (label, value) in enumerate(bars):
-        color = SERIES_COLORS[index % len(SERIES_COLORS)]
-        bar_height = 0 if padded_max == 0 else int((value / padded_max) * plot_height)
-        draw.rectangle((x_pos, bottom - bar_height, x_pos + bar_width, bottom), fill=color, outline=color)
-        draw.text((x_pos, bottom + 10), label, fill="black", font=font)
-        x_pos += bar_width + gap
-
-    draw.text((PNG_WIDTH // 2 - 50, PNG_HEIGHT - 36), x_label, fill="black", font=font)
-    draw.text((10, 36), y_label, fill="black", font=font)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path, format="PNG")
+    fig.tight_layout()
+    fig.savefig(output_path, format="png")
+    plt.close(fig)
 
 
 def write_summary_markdown(
@@ -1466,6 +1421,11 @@ def refresh_experiment_artifacts(
     aggregated_rows = aggregate_records(records)
     aggregated_fieldnames = [
         "algorithm",
+        "n",
+        "t",
+        "b",
+        "run",
+        "wall",
         "matrix_size",
         "threads",
         "base_case",
@@ -1481,7 +1441,7 @@ def refresh_experiment_artifacts(
     for plot_spec in build_plot_specs(aggregated_rows, args.comparison_base_case):
         output_path = plots_dir / str(plot_spec["filename"])
         if plot_spec["kind"] == "line":
-            draw_line_plot(
+            render_line_plot(
                 output_path,
                 str(plot_spec["title"]),
                 str(plot_spec["x_label"]),
@@ -1489,13 +1449,23 @@ def refresh_experiment_artifacts(
                 dict(plot_spec["series"]),
             )
         else:
-            draw_bar_plot(
+            render_bar_plot(
                 output_path,
                 str(plot_spec["title"]),
                 str(plot_spec["x_label"]),
                 str(plot_spec["y_label"]),
                 list(plot_spec["bars"]),
             )
+
+    for plot_spec in build_raw_run_plot_specs(records):
+        output_path = plots_dir / str(plot_spec["filename"])
+        render_line_plot(
+            output_path,
+            str(plot_spec["title"]),
+            str(plot_spec["x_label"]),
+            str(plot_spec["y_label"]),
+            dict(plot_spec["series"]),
+        )
 
     write_summary_markdown(summary_path, records, aggregated_rows, args, configs)
 
@@ -1544,37 +1514,40 @@ def run_experiments(args: argparse.Namespace) -> int:
             continue
 
         print(f"\n=== Matrix size n={matrix_size} ===")
-        total_configs_for_size = count_size_configurations(matrix_size, configs)
-        print(f"Planned configurations for n={matrix_size}: {total_configs_for_size}")
         size_failed = False
-        completed_configs_for_size = 0
-        input_stem = input_stem_for_size(matrix_size)
-        input_path = input_dir / f"{input_stem}.txt"
-        input_seed = derive_seed(args.seed, matrix_size, 1)
-        if not input_path.exists():
-            write_assignment_input(
-                input_path,
-                matrix_size,
-                input_seed,
-                args.min_value,
-                args.max_value,
-            )
 
         try:
             stop_current_size = False
-            for algorithm_name in ALGORITHMS:
-                config = configs[algorithm_name]
-                if not config.enabled or matrix_size not in config.matrix_sizes:
-                    continue
+            max_repetitions_for_size = max(
+                config.repetitions
+                for config in configs.values()
+                if config.enabled and matrix_size in config.matrix_sizes
+            )
+            for run_index in range(1, max_repetitions_for_size + 1):
+                seed = derive_seed(args.seed, matrix_size, run_index)
+                input_stem = input_stem_for_run(matrix_size, run_index)
+                input_path = input_dir / f"{input_stem}.txt"
+                write_assignment_input(
+                    input_path,
+                    matrix_size,
+                    seed,
+                    args.min_value,
+                    args.max_value,
+                )
 
-                for run_index in range(1, config.repetitions + 1):
-                    seed = input_seed
+                for algorithm_name in ALGORITHMS:
+                    config = configs[algorithm_name]
+                    if (
+                        not config.enabled
+                        or matrix_size not in config.matrix_sizes
+                        or run_index > config.repetitions
+                    ):
+                        continue
+
                     for base_case in config.base_cases:
                         for thread in config.threads:
-                            completed_configs_for_size += 1
                             print(
-                                f"[{completed_configs_for_size}/{total_configs_for_size}] "
-                                f"Starting {algorithm_name} for n={matrix_size}, "
+                                f"Running {algorithm_name} for n={matrix_size}, "
                                 f"t={thread}, b={base_case}, run={run_index}"
                             )
                             record = run_algorithm(
@@ -1587,7 +1560,6 @@ def run_experiments(args: argparse.Namespace) -> int:
                                 thread,
                                 base_case,
                                 run_index,
-                                config.repetitions,
                                 seed,
                                 args.timeout_seconds,
                             )
@@ -1597,18 +1569,11 @@ def run_experiments(args: argparse.Namespace) -> int:
                                 if record.runtime_seconds is not None
                                 else ""
                             )
-                            wall_clock_note = (
-                                f", wall={record.wall_clock_seconds:.3f}s"
-                                if record.wall_clock_seconds is not None
-                                else ""
-                            )
                             print(
-                                f"[{completed_configs_for_size}/{total_configs_for_size}] "
                                 f"Finished {algorithm_name} for n={matrix_size}, "
                                 f"t={thread}, b={base_case}, run={run_index}: "
-                                f"status={record.status}{runtime_note}{wall_clock_note}"
+                                f"status={record.status}{runtime_note}"
                             )
-                            print("Refreshing CSV/plots...")
                             refresh_experiment_artifacts(records, results_dir, plots_dir, args, configs)
                             if record.status != "ok":
                                 size_failed = True
@@ -1628,12 +1593,7 @@ def run_experiments(args: argparse.Namespace) -> int:
 
         if size_failed and not args.keep_going_after_size_failure:
             size_failure_cutoff = matrix_size
-            print(
-                f"Stopping larger sizes because n={matrix_size} failed. "
-                "Use --keep-going-after-size-failure to continue anyway."
-            )
 
-    print("Refreshing CSV/plots...")
     refresh_experiment_artifacts(records, results_dir, plots_dir, args, configs)
 
     raw_results_path = results_dir / "raw_results.csv"
